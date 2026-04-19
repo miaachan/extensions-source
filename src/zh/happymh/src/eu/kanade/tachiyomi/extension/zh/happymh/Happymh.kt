@@ -34,8 +34,7 @@ import uy.kohesive.injekt.injectLazy
 
 const val PREF_KEY_CUSTOM_UA = "pref_key_custom_ua_"
 private const val DEFAULT_BROWSER_UA =
-    "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/86.0.4240.198 Safari/537.36 QIHU 360ENT"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:149.0) Gecko/20100101 Firefox/149.0"
 
 class Happymh : HttpSource(), ConfigurableSource {
     override val name: String = "嗨皮漫画"
@@ -173,13 +172,16 @@ class Happymh : HttpSource(), ConfigurableSource {
     // Chapters
 
     private fun fetchChapterByPage(comicId: String, page: Int): ChapterByPageResponseData {
+        val requestId = System.currentTimeMillis().toString()
         val url = "$baseUrl/v2.0/apis/manga/chapterByPage".toHttpUrl().newBuilder()
             .addQueryParameter("code", comicId)
             .addQueryParameter("lang", "cn")
             .addQueryParameter("order", "asc")
             .addQueryParameter("page", "$page")
+            .addQueryParameter("_t", requestId)
             .build()
-        return client.newCall(GET(url, headers)).execute().parseAs<ChapterByPageResponse>().data
+        return client.newCall(GET(url, ajaxHeadersBuilder(requestId).build())).execute()
+            .parseAs<ChapterByPageResponse>().data
     }
 
     private fun fetchChapterByPage(manga: SManga, page: Int): ChapterByPageResponseData {
@@ -236,14 +238,18 @@ class Happymh : HttpSource(), ConfigurableSource {
             // Old format is detected
             throw Exception("请刷新章节列表")
         }
+        val requestId = System.currentTimeMillis().toString()
         val chapterUrl = "$baseUrl${chapter.url}".toHttpUrl()
         val comicId = chapterUrl.pathSegments[0]
         val chapterId = chapterUrl.pathSegments[2]
 
-        val url = "$baseUrl/v2.0/apis/manga/reading?code=$comicId&cid=$chapterId&v=v3.1919111"
-        // Some chapters return 403 without this header
-        val headers = headersBuilder()
-            .add("X-Requested-With", "XMLHttpRequest")
+        val url = "$baseUrl/v2.0/apis/manga/reading".toHttpUrl().newBuilder()
+            .addQueryParameter("code", comicId)
+            .addQueryParameter("cid", chapterId)
+            .addQueryParameter("v", "v4.203411")
+            .addQueryParameter("_t", requestId)
+            .build()
+        val headers = ajaxHeadersBuilder(requestId, accept = "application/json")
             .set("Referer", "$baseUrl/mangaread/$comicId/$chapterId")
             .build()
         return GET(url, headers)
@@ -294,6 +300,16 @@ class Happymh : HttpSource(), ConfigurableSource {
 
     private inline fun <reified T> Response.parseAs(): T = use {
         json.decodeFromStream(it.body.byteStream())
+    }
+
+    private fun ajaxHeadersBuilder(
+        requestId: String,
+        accept: String = "application/json, text/plain, */*",
+    ): Headers.Builder {
+        return headersBuilder()
+            .set("Accept", accept)
+            .add("X-Requested-With", "XMLHttpRequest")
+            .add("X-Requested-Id", requestId)
     }
 
     private fun ChapterByPageResponseData.isPageEnd(): Boolean {
