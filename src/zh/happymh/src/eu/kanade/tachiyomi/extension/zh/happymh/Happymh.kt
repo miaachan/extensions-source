@@ -41,7 +41,6 @@ class Happymh : HttpSource(), ConfigurableSource {
 
     override val baseUrl: String = "https://m.happymh.com"
     private val json: Json by injectLazy()
-    private val chapterUrlToCode = hashMapOf<String, String>()
 
     private val preferences = getPreferences()
 
@@ -181,7 +180,8 @@ class Happymh : HttpSource(), ConfigurableSource {
             .addQueryParameter("order", "asc")
             .addQueryParameter("page", "$page")
             .build()
-        return client.newCall(GET(url, headers)).execute().parseAs<ChapterByPageResponse>().data
+        return client.newCall(GET(url, ajaxHeadersBuilder().build())).execute()
+            .parseAs<ChapterByPageResponse>().data
     }
 
     private fun fetchChapterByPage(manga: SManga, page: Int): ChapterByPageResponseData {
@@ -225,54 +225,42 @@ class Happymh : HttpSource(), ConfigurableSource {
     override fun chapterListParse(response: Response) = throw UnsupportedOperationException()
 
     override fun getChapterUrl(chapter: SChapter): String {
-        return baseUrl + (chapterUrlToCode[chapter.url]?.let { "/mangaread/$it" } ?: chapter.url)
+        val url = "$baseUrl${chapter.url}".toHttpUrl()
+        val comicId = url.pathSegments[0]
+        val chapterId = url.pathSegments[2]
+        return "$baseUrl/mangaread/$comicId/$chapterId"
     }
 
     // Pages
-
-    private fun fetchChapterCode(chapter: SChapter): String? {
-        val url = "$baseUrl${chapter.url}".toHttpUrl()
-        val expectPage = url.fragment?.toIntOrNull() ?: 1
-        val comicId = url.pathSegments[0]
-        val chapterId = url.pathSegments[2].toLong()
-        var code = fetchChapterByPage(comicId, expectPage).items.find { it.id == chapterId }?.codes
-        if (code == null) {
-            // Do full search for find target code
-            var page = 1
-            var end = false
-            while (!end && code == null) {
-                val resp = fetchChapterByPage(comicId, page)
-                code = resp.items.find { it.id == chapterId }?.codes
-                end = resp.isPageEnd()
-                page += 1
-            }
-        }
-        return code?.also { chapterUrlToCode[chapter.url] = it }
-    }
 
     override fun pageListRequest(chapter: SChapter): Request {
         if (!chapter.url.contains(DUMMY_CHAPTER_MARK)) {
             // Old format is detected
             throw Exception("请刷新章节列表")
         }
-        val code = fetchChapterCode(chapter) ?: throw Exception("找不到章节地址，请尝试刷新章节列表")
-        val url = "$baseUrl/v2.0/apis/manga/reading?code=$code&v=v3.1818134"
-        // Some chapters return 403 without this header
-        val headers = headersBuilder()
-            .add("X-Requested-With", "XMLHttpRequest")
-            .set("Referer", baseUrl + chapter.url)
+        val chapterUrl = "$baseUrl${chapter.url}".toHttpUrl()
+        val comicId = chapterUrl.pathSegments[0]
+        val chapterId = chapterUrl.pathSegments[2]
+
+        val url = "$baseUrl/v2.0/apis/manga/reading?code=$comicId&cid=$chapterId&v=v3.1919111"
+        val headers = ajaxHeadersBuilder()
+            .set("Referer", "$baseUrl/mangaread/$comicId/$chapterId")
             .build()
         return GET(url, headers)
     }
 
-    override fun pageListParse(response: Response): List<Page> {
-        return response.parseAs<PageListResponseDto>().data.scans
-            // If n == 1, the image is from next chapter
-            .filter { it.n == 0 }
-            .mapIndexed { index, it ->
-                Page(index, "", it.url)
+    override fun pageListParse(response: Response): List<Page> = response.parseAs<PageListResponseDto>().data.scans
+        // If n == 1, the image is from next chapter
+        .filter { it.n == 0 }
+        .mapIndexed { index, it ->
+            // Large images can trigger WebpExceedRange when the CDN applies q=... conversion.
+            val url = if (it.width > 16383 || it.height > 16383) {
+                it.url.substringBefore("?q=")
+            } else {
+                it.url
             }
-    }
+            Page(index, "", url)
+        }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
@@ -306,6 +294,13 @@ class Happymh : HttpSource(), ConfigurableSource {
 
     private inline fun <reified T> Response.parseAs(): T = use {
         json.decodeFromStream(it.body.byteStream())
+    }
+
+    private fun ajaxHeadersBuilder(): Headers.Builder {
+        return headersBuilder()
+            .add("Accept", "application/json, text/plain, */*")
+            .add("X-Requested-Id", System.currentTimeMillis().toString())
+            .add("X-Requested-With", "XMLHttpRequest")
     }
 
     private fun ChapterByPageResponseData.isPageEnd(): Boolean {
