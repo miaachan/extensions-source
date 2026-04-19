@@ -33,6 +33,9 @@ import rx.Observable
 import uy.kohesive.injekt.injectLazy
 
 const val PREF_KEY_CUSTOM_UA = "pref_key_custom_ua_"
+private const val DEFAULT_BROWSER_UA =
+    "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/86.0.4240.198 Safari/537.36 QIHU 360ENT"
 
 class Happymh : HttpSource(), ConfigurableSource {
     override val name: String = "嗨皮漫画"
@@ -54,33 +57,18 @@ class Happymh : HttpSource(), ConfigurableSource {
     }
 
     private val rewriteOctetStream: Interceptor = Interceptor { chain ->
-        val request = chain.request()
-        val originalResponse = chain.proceed(request)
-
-        val response = if (
-            originalResponse.code in listOf(400, 403) &&
-            request.url.queryParameter("q") != null
-        ) {
-            originalResponse.close()
-            val retryRequest = request.newBuilder()
-                .url(request.url.newBuilder().removeAllQueryParameters("q").build())
-                .build()
-            chain.proceed(retryRequest)
-        } else {
-            originalResponse
-        }
-
-        if (response.headers("Content-Type")
-            .contains("application/octet-stream") && response.request.url.toString()
+        val originalResponse: Response = chain.proceed(chain.request())
+        if (originalResponse.headers("Content-Type")
+            .contains("application/octet-stream") && originalResponse.request.url.toString()
                 .contains(".jpg")
         ) {
-            val orgBody = response.body.source()
+            val orgBody = originalResponse.body.source()
             val newBody = orgBody.asResponseBody("image/jpeg".toMediaType())
-            response.newBuilder()
+            originalResponse.newBuilder()
                 .body(newBody)
                 .build()
         } else {
-            response
+            originalResponse
         }
     }
 
@@ -91,11 +79,7 @@ class Happymh : HttpSource(), ConfigurableSource {
     override fun headersBuilder(): Headers.Builder {
         val builder = super.headersBuilder()
         val userAgent = preferences.getString(PREF_KEY_CUSTOM_UA, "")!!
-        return if (userAgent.isNotBlank()) {
-            builder.set("User-Agent", userAgent)
-        } else {
-            builder
-        }
+        return builder.set("User-Agent", userAgent.ifBlank { DEFAULT_BROWSER_UA })
     }
 
     // Popular
@@ -195,8 +179,7 @@ class Happymh : HttpSource(), ConfigurableSource {
             .addQueryParameter("order", "asc")
             .addQueryParameter("page", "$page")
             .build()
-        return client.newCall(GET(url, ajaxHeadersBuilder().build())).execute()
-            .parseAs<ChapterByPageResponse>().data
+        return client.newCall(GET(url, headers)).execute().parseAs<ChapterByPageResponse>().data
     }
 
     private fun fetchChapterByPage(manga: SManga, page: Int): ChapterByPageResponseData {
@@ -258,35 +241,32 @@ class Happymh : HttpSource(), ConfigurableSource {
         val chapterId = chapterUrl.pathSegments[2]
 
         val url = "$baseUrl/v2.0/apis/manga/reading?code=$comicId&cid=$chapterId&v=v3.1919111"
-        val headers = ajaxHeadersBuilder()
+        // Some chapters return 403 without this header
+        val headers = headersBuilder()
+            .add("X-Requested-With", "XMLHttpRequest")
             .set("Referer", "$baseUrl/mangaread/$comicId/$chapterId")
             .build()
         return GET(url, headers)
     }
 
-    override fun pageListParse(response: Response): List<Page> {
-        val referer = response.request.header("Referer").orEmpty()
-        return response.parseAs<PageListResponseDto>().data.scans
-            // If n == 1, the image is from next chapter
-            .filter { it.n == 0 }
-            .mapIndexed { index, it ->
-                // Large images can trigger WebpExceedRange when the CDN applies q=... conversion.
-                val url = if (it.width > 16383 || it.height > 16383) {
-                    it.url.substringBefore("?q=")
-                } else {
-                    it.url
-                }
-                Page(index, referer, url)
+    override fun pageListParse(response: Response): List<Page> = response.parseAs<PageListResponseDto>().data.scans
+        // If n == 1, the image is from next chapter
+        .filter { it.n == 0 }
+        .mapIndexed { index, it ->
+            // Strip q=... for large images (> 16383px) to avoid WebpExceedRange error
+            val url = if (it.width > 16383 || it.height > 16383) {
+                it.url.substringBefore("?q=")
+            } else {
+                it.url
             }
-    }
+            Page(index, "", url)
+        }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
     override fun imageRequest(page: Page): Request {
         val headers = headersBuilder()
-            .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
-            .set("Origin", baseUrl)
-            .set("Referer", page.url.ifBlank { "$baseUrl/" })
+            .set("Referer", "$baseUrl/")
             .build()
         return GET(page.imageUrl!!, headers)
     }
@@ -297,7 +277,7 @@ class Happymh : HttpSource(), ConfigurableSource {
         EditTextPreference(context).apply {
             key = PREF_KEY_CUSTOM_UA
             title = "User Agent"
-            summary = "留空则使用应用设置中的默认 User Agent，重启生效"
+            summary = "留空则使用内置浏览器 User Agent，重启生效"
 
             setOnPreferenceChangeListener { _, newValue ->
                 try {
@@ -314,13 +294,6 @@ class Happymh : HttpSource(), ConfigurableSource {
 
     private inline fun <reified T> Response.parseAs(): T = use {
         json.decodeFromStream(it.body.byteStream())
-    }
-
-    private fun ajaxHeadersBuilder(): Headers.Builder {
-        return headersBuilder()
-            .add("Accept", "application/json, text/plain, */*")
-            .add("X-Requested-Id", System.currentTimeMillis().toString())
-            .add("X-Requested-With", "XMLHttpRequest")
     }
 
     private fun ChapterByPageResponseData.isPageEnd(): Boolean {
