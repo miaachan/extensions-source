@@ -54,18 +54,33 @@ class Happymh : HttpSource(), ConfigurableSource {
     }
 
     private val rewriteOctetStream: Interceptor = Interceptor { chain ->
-        val originalResponse: Response = chain.proceed(chain.request())
-        if (originalResponse.headers("Content-Type")
-            .contains("application/octet-stream") && originalResponse.request.url.toString()
+        val request = chain.request()
+        val originalResponse = chain.proceed(request)
+
+        val response = if (
+            originalResponse.code in listOf(400, 403) &&
+            request.url.queryParameter("q") != null
+        ) {
+            originalResponse.close()
+            val retryRequest = request.newBuilder()
+                .url(request.url.newBuilder().removeAllQueryParameters("q").build())
+                .build()
+            chain.proceed(retryRequest)
+        } else {
+            originalResponse
+        }
+
+        if (response.headers("Content-Type")
+            .contains("application/octet-stream") && response.request.url.toString()
                 .contains(".jpg")
         ) {
-            val orgBody = originalResponse.body.source()
+            val orgBody = response.body.source()
             val newBody = orgBody.asResponseBody("image/jpeg".toMediaType())
-            originalResponse.newBuilder()
+            response.newBuilder()
                 .body(newBody)
                 .build()
         } else {
-            originalResponse
+            response
         }
     }
 
@@ -249,24 +264,29 @@ class Happymh : HttpSource(), ConfigurableSource {
         return GET(url, headers)
     }
 
-    override fun pageListParse(response: Response): List<Page> = response.parseAs<PageListResponseDto>().data.scans
-        // If n == 1, the image is from next chapter
-        .filter { it.n == 0 }
-        .mapIndexed { index, it ->
-            // Large images can trigger WebpExceedRange when the CDN applies q=... conversion.
-            val url = if (it.width > 16383 || it.height > 16383) {
-                it.url.substringBefore("?q=")
-            } else {
-                it.url
+    override fun pageListParse(response: Response): List<Page> {
+        val referer = response.request.header("Referer").orEmpty()
+        return response.parseAs<PageListResponseDto>().data.scans
+            // If n == 1, the image is from next chapter
+            .filter { it.n == 0 }
+            .mapIndexed { index, it ->
+                // Large images can trigger WebpExceedRange when the CDN applies q=... conversion.
+                val url = if (it.width > 16383 || it.height > 16383) {
+                    it.url.substringBefore("?q=")
+                } else {
+                    it.url
+                }
+                Page(index, referer, url)
             }
-            Page(index, "", url)
-        }
+    }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
     override fun imageRequest(page: Page): Request {
         val headers = headersBuilder()
-            .set("Referer", "$baseUrl/")
+            .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+            .set("Origin", baseUrl)
+            .set("Referer", page.url.ifBlank { "$baseUrl/" })
             .build()
         return GET(page.imageUrl!!, headers)
     }
